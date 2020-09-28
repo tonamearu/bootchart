@@ -436,7 +436,7 @@ def _parse_proc_stat_log(file):
             user = float((times[0] + times[1]) - (ltimes[0] + ltimes[1]))
             system = float((times[2] + times[5] + times[6]) - (ltimes[2] + ltimes[5] + ltimes[6]))
             idle = float(times[3] - ltimes[3])
-            iowait = float(times[4] - ltimes[4])
+            iowait = float( max(times[4] - ltimes[4], 0) ) # iowait can decrease sometimes
 
             aSum = max(user + system + idle + iowait, 1)
             samples.append( CPUSample(time, user/aSum, system/aSum, iowait/aSum) )
