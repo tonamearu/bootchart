@@ -13,235 +13,215 @@
 #  You should have received a copy of the GNU General Public License
 #  along with pybootchartgui. If not, see <http://www.gnu.org/licenses/>.
 
-import gobject
-import gtk
-import gtk.gdk
-import gtk.keysyms
+import math
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import GObject
+from gi.repository import Gtk
+from gi.repository import Gdk
 from . import draw
 from .draw import RenderOptions
 
-class PyBootchartWidget(gtk.DrawingArea):
-    __gsignals__ = {
-            'expose-event': 'override',
-            'clicked' : (gobject.SIGNAL_RUN_LAST, gobject.TYPE_NONE, (gobject.TYPE_STRING, gtk.gdk.Event)),
-            'position-changed' : (gobject.SIGNAL_RUN_LAST, gobject.TYPE_NONE, (gobject.TYPE_INT, gobject.TYPE_INT)),
-            'set-scroll-adjustments' : (gobject.SIGNAL_RUN_LAST, gobject.TYPE_NONE, (gtk.Adjustment, gtk.Adjustment))
-    }
+class PyBootchartWidget(Gtk.DrawingArea):
+    # last mouse event state
+    last_mx = None
+    last_my = None
+    last_b = None
+    line_x = -1
 
     def __init__(self, trace, options, xscale):
-        gtk.DrawingArea.__init__(self)
+        Gtk.DrawingArea.__init__(self)
 
         self.trace = trace
         self.options = options
 
-        self.set_flags(gtk.CAN_FOCUS)
+        self.set_can_focus(True)
 
-        self.add_events(gtk.gdk.BUTTON_PRESS_MASK | gtk.gdk.BUTTON_RELEASE_MASK)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.POINTER_MOTION_HINT_MASK)
         self.connect("button-press-event", self.on_area_button_press)
         self.connect("button-release-event", self.on_area_button_release)
-        self.add_events(gtk.gdk.POINTER_MOTION_MASK | gtk.gdk.POINTER_MOTION_HINT_MASK | gtk.gdk.BUTTON_RELEASE_MASK)
         self.connect("motion-notify-event", self.on_area_motion_notify)
         self.connect("scroll-event", self.on_area_scroll_event)
         self.connect('key-press-event', self.on_key_press_event)
 
-        self.connect('set-scroll-adjustments', self.on_set_scroll_adjustments)
-        self.connect("size-allocate", self.on_allocation_size_changed)
-        self.connect("position-changed", self.on_position_changed)
-
         self.zoom_ratio = 1.0
         self.xscale = xscale
-        self.x, self.y = 0.0, 0.0
+        self.original_scale = xscale
 
         self.chart_width, self.chart_height = draw.extents(self.options, self.xscale, self.trace)
-        self.hadj = None
-        self.vadj = None
-        self.hadj_changed_signal_id = None
-        self.vadj_changed_signal_id = None
 
-    def do_expose_event(self, event):
-        cr = self.window.cairo_create()
+        # scrollable properties
+        self.hadj = Gtk.Adjustment(0,0,self.chart_width)
+        self.vadj = Gtk.Adjustment(0,0,self.chart_height)
 
-        # set a clip region for the expose event
-        cr.rectangle(
-                event.area.x, event.area.y,
-                event.area.width, event.area.height
-        )
-        cr.clip()
-        self.draw(cr, self.get_allocation())
-        return False
-
-    def draw(self, cr, rect):
-        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0)
-        cr.paint()
+    def do_draw(self, cr):
+        cr.set_source_rgba(*draw.WHITE)
         cr.scale(self.zoom_ratio, self.zoom_ratio)
-        cr.translate(-self.x, -self.y)
         draw.render(cr, self.options, self.xscale, self.trace)
+        # draw vertical line
+        if self.line_x>=0:
+            cr.set_source_rgba(*self.VLINE_MARK_COLOR)
+            cr.set_dash([6,2], 0)
+            cr.set_line_width(1)
+            cr.move_to(self.line_x*self.xscale+draw.off_x, 0)
+            cr.line_to(self.line_x*self.xscale+draw.off_x, self.chart_height)
+            cr.stroke()
 
-    def position_changed(self):
-        self.emit("position-changed", self.x, self.y)
+    def do_get_preferred_width(self):
+        width = self.chart_width * self.zoom_ratio
+        return (width, width)
 
-    ZOOM_INCREMENT = 1.25
+    def do_get_preferred_height(self):
+        height = self.chart_height * self.zoom_ratio
+        return (height, height)
 
-    def zoom_image (self, zoom_ratio):
+    def relativePos(self, adj):
+        high = (adj.get_upper() - adj.get_lower());
+        if high != 0:
+            return (adj.get_value() + adj.get_page_size()/2 - adj.get_lower()) / high
+        else:
+            return 0
+
+    def setRelativePos(self, adj, x, w):
+        adj.set_upper( w )
+        adj.set_value( x * (adj.get_upper() - adj.get_lower()) + adj.get_lower() - adj.get_page_size()/2 )
+
+    def zoom_image (self, zoom_ratio, xscale):
+        offset_x = self.relativePos(self.hadj)
+        offset_y = self.relativePos(self.vadj)
         self.zoom_ratio = zoom_ratio
-        self._set_scroll_adjustments (self.hadj, self.vadj)
-        self.queue_draw()
-
-    def zoom_to_rect (self, rect):
-        zoom_ratio = float(rect.width)/float(self.chart_width)
-        self.zoom_image(zoom_ratio)
-        self.x = 0
-        self.position_changed()
-
-    def set_xscale(self, xscale):
-        old_mid_x = self.x + self.hadj.page_size / 2
         self.xscale = xscale
         self.chart_width, self.chart_height = draw.extents(self.options, self.xscale, self.trace)
-        new_x = old_mid_x
-        self.zoom_image (self.zoom_ratio)
+        self.setRelativePos(self.hadj, offset_x, self.chart_width * self.zoom_ratio)
+        self.setRelativePos(self.vadj, offset_y, self.chart_height * self.zoom_ratio)
+        self.queue_resize()
+
+    def offset_image(self, dx, dy):
+        self.hadj.set_value(self.hadj.get_value()+dx)
+        self.vadj.set_value(self.vadj.get_value()+dy)
+        self.queue_draw()
+
+    ZOOM_INCREMENT = 1.25
+    ZOOM_MOUSE_INCREMENT = 1.0025
+    POS_INCREMENT = 100
+    SCALE_INCREMENT = 1.5
+    VLINE_MARK_COLOR = (0.0, 0.5, 0.0, 1.0)
 
     def on_expand(self, action):
-        self.set_xscale (self.xscale * 1.5)
+        self.zoom_image(self.zoom_ratio, self.xscale * self.SCALE_INCREMENT)
 
     def on_contract(self, action):
-        self.set_xscale (self.xscale / 1.5)
+        self.zoom_image(self.zoom_ratio, self.xscale / self.SCALE_INCREMENT)
 
     def on_zoom_in(self, action):
-        self.zoom_image(self.zoom_ratio * self.ZOOM_INCREMENT)
+        self.zoom_image(self.zoom_ratio * self.ZOOM_INCREMENT, self.xscale)
 
     def on_zoom_out(self, action):
-        self.zoom_image(self.zoom_ratio / self.ZOOM_INCREMENT)
+        self.zoom_image(self.zoom_ratio / self.ZOOM_INCREMENT, self.xscale)
 
     def on_zoom_fit(self, action):
-        self.zoom_to_rect(self.get_allocation())
+        self.xscale=self.original_scale
+        self.chart_width, self.chart_height = draw.extents(self.options, self.xscale, self.trace)
+        self.zoom_image(float(self.hadj.get_page_size())/self.chart_width, self.xscale)
 
     def on_zoom_100(self, action):
-        self.zoom_image(1.0)
-        self.set_xscale(1.0)
+        self.zoom_image(1.0, self.original_scale)
 
     def show_toggled(self, button):
-        self.options.app_options.show_all = button.get_property ('active')
+        self.options.app_options.show_all = button.get_active()
         self.queue_draw()
-
-    POS_INCREMENT = 100
 
     def on_key_press_event(self, widget, event):
-        if event.keyval == gtk.keysyms.Left:
-            self.x -= self.POS_INCREMENT/self.zoom_ratio
-        elif event.keyval == gtk.keysyms.Right:
-            self.x += self.POS_INCREMENT/self.zoom_ratio
-        elif event.keyval == gtk.keysyms.Up:
-            self.y -= self.POS_INCREMENT/self.zoom_ratio
-        elif event.keyval == gtk.keysyms.Down:
-            self.y += self.POS_INCREMENT/self.zoom_ratio
+        if event.keyval == Gdk.KEY_Left:
+            self.offset_image(-self.POS_INCREMENT, 0)
+        elif event.keyval == Gdk.KEY_Right:
+            self.offset_image(self.POS_INCREMENT, 0)
+        elif event.keyval == Gdk.KEY_Up:
+            self.offset_image(0, -self.POS_INCREMENT)
+        elif event.keyval == Gdk.KEY_Down:
+            self.offset_image(0, self.POS_INCREMENT)
+        elif event.keyval == Gdk.KEY_equal or event.keyval == Gdk.KEY_plus or event.keyval == Gdk.KEY_KP_Add:
+            self.on_zoom_in(None)
+        elif event.keyval == Gdk.KEY_underscore or event.keyval == Gdk.KEY_minus or event.keyval == Gdk.KEY_KP_Subtract:
+            self.on_zoom_out(None)
         else:
             return False
-        self.queue_draw()
-        self.position_changed()
         return True
 
     def on_area_button_press(self, area, event):
-        if event.button == 2 or event.button == 1:
-            area.window.set_cursor(gtk.gdk.Cursor(gtk.gdk.FLEUR))
-            self.prevmousex = event.x
-            self.prevmousey = event.y
-        if event.type not in (gtk.gdk.BUTTON_PRESS, gtk.gdk.BUTTON_RELEASE):
-            return False
+        if self.last_b == None:
+            self.last_b = event.button
+            self.last_mx = event.x_root
+            self.last_my = event.y_root
+            if self.last_b == 2:
+                # set vertical line
+                if self.zoom_ratio!=0 and self.xscale!=0:
+                    self.line_x = (event.x/self.zoom_ratio-draw.off_x)/self.xscale
+                else:
+                    self.line_x = -1
+                self.queue_draw()
+            if self.last_b==3:
+                area.get_window().set_cursor(Gdk.Cursor(Gdk.CursorType.SB_H_DOUBLE_ARROW))
+            else:
+                area.get_window().set_cursor(Gdk.Cursor(Gdk.CursorType.FLEUR))
+            self.grab_focus() # select the component on a mouse button press
+            self.queue_draw()
         return False
 
     def on_area_button_release(self, area, event):
-        if event.button == 2 or event.button == 1:
-            area.window.set_cursor(gtk.gdk.Cursor(gtk.gdk.ARROW))
-            self.prevmousex = None
-            self.prevmousey = None
-            return True
+        if self.last_b != None:
+            if event.button == self.last_b:
+                if self.last_b == 2:
+                    # set vertical line
+                    if self.zoom_ratio!=0 and self.xscale!=0:
+                        self.line_x = (event.x/self.zoom_ratio-draw.off_x)/self.xscale
+                    else:
+                        self.line_x = -1
+                    self.queue_draw()
+                elif self.last_b==3:
+                    # zoom the image
+                    self.zoom_image(self.zoom_ratio*math.pow(self.ZOOM_MOUSE_INCREMENT, event.x_root - self.last_mx), self.xscale)
+                else:
+                    # pan the image
+                    self.offset_image(self.last_mx - event.x_root, self.last_my - event.y_root)
+                area.get_window().set_cursor(None)
+                self.last_b=None
+                self.last_mx=None
+                self.last_my=None
         return False
 
     def on_area_scroll_event(self, area, event):
-        if event.state & gtk.gdk.CONTROL_MASK:
-            if event.direction == gtk.gdk.SCROLL_UP:
+        if (event.state & Gdk.ModifierType.CONTROL_MASK) != 0:
+            if event.direction == Gdk.ScrollDirection.UP:
                 self.zoom_image(self.zoom_ratio * self.ZOOM_INCREMENT)
                 return True
-            if event.direction == gtk.gdk.SCROLL_DOWN:
+            if event.direction == Gdk.ScrollDirection.DOWN:
                 self.zoom_image(self.zoom_ratio / self.ZOOM_INCREMENT)
                 return True
             return False
 
     def on_area_motion_notify(self, area, event):
-        state = event.state
-        if state & gtk.gdk.BUTTON2_MASK or state & gtk.gdk.BUTTON1_MASK:
-            x, y = int(event.x), int(event.y)
-            # pan the image
-            self.x += (self.prevmousex - x)/self.zoom_ratio
-            self.y += (self.prevmousey - y)/self.zoom_ratio
-            self.queue_draw()
-            self.prevmousex = x
-            self.prevmousey = y
-            self.position_changed()
-        return True
+        if self.last_b != None:
+            if self.last_b == 2:
+                # set vertical line
+                if self.zoom_ratio!=0 and self.xscale!=0:
+                    self.line_x = (event.x/self.zoom_ratio-draw.off_x)/self.xscale
+                else:
+                    self.line_x = -1
+                self.queue_draw()
+            elif self.last_b == 3:
+                # zoom the image
+                self.zoom_image(self.zoom_ratio*math.pow(self.ZOOM_MOUSE_INCREMENT, event.x_root - self.last_mx), self.xscale)
+            else:
+                # pan the image
+                self.offset_image(self.last_mx - event.x_root, self.last_my - event.y_root)
+            self.last_mx = event.x_root
+            self.last_my = event.y_root
+        return False
 
-    def on_set_scroll_adjustments(self, area, hadj, vadj):
-        self._set_scroll_adjustments (hadj, vadj)
 
-    def on_allocation_size_changed(self, widget, allocation):
-        self.hadj.page_size = allocation.width
-        self.hadj.page_increment = allocation.width * 0.9
-        self.vadj.page_size = allocation.height
-        self.vadj.page_increment = allocation.height * 0.9
-
-    def _set_adj_upper(self, adj, upper):
-        changed = False
-        value_changed = False
-
-        if adj.upper != upper:
-            adj.upper = upper
-            changed = True
-
-        max_value = max(0.0, upper - adj.page_size)
-        if adj.value > max_value:
-            adj.value = max_value
-            value_changed = True
-
-        if changed:
-            adj.changed()
-        if value_changed:
-            adj.value_changed()
-
-    def _set_scroll_adjustments(self, hadj, vadj):
-        if hadj == None:
-            hadj = gtk.Adjustment(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        if vadj == None:
-            vadj = gtk.Adjustment(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-
-        if self.hadj_changed_signal_id != None and \
-           self.hadj != None and hadj != self.hadj:
-            self.hadj.disconnect (self.hadj_changed_signal_id)
-        if self.vadj_changed_signal_id != None and \
-           self.vadj != None and vadj != self.vadj:
-            self.vadj.disconnect (self.vadj_changed_signal_id)
-
-        if hadj != None:
-            self.hadj = hadj
-            self._set_adj_upper (self.hadj, self.zoom_ratio * self.chart_width)
-            self.hadj_changed_signal_id = self.hadj.connect('value-changed', self.on_adjustments_changed)
-
-        if vadj != None:
-            self.vadj = vadj
-            self._set_adj_upper (self.vadj, self.zoom_ratio * self.chart_height)
-            self.vadj_changed_signal_id = self.vadj.connect('value-changed', self.on_adjustments_changed)
-
-    def on_adjustments_changed(self, adj):
-        self.x = self.hadj.value / self.zoom_ratio
-        self.y = self.vadj.value / self.zoom_ratio
-        self.queue_draw()
-
-    def on_position_changed(self, widget, x, y):
-        self.hadj.value = x * self.zoom_ratio
-        self.vadj.value = y * self.zoom_ratio
-
-PyBootchartWidget.set_set_scroll_adjustments_signal('set-scroll-adjustments')
-
-class PyBootchartShell(gtk.VBox):
+class PyBootchartShell(Gtk.VBox):
     ui = '''
     <ui>
             <toolbar name="ToolBar">
@@ -252,33 +232,49 @@ class PyBootchartShell(gtk.VBox):
                     <toolitem action="ZoomOut"/>
                     <toolitem action="ZoomFit"/>
                     <toolitem action="Zoom100"/>
+                    <separator/>
+                    <toolitem action="Help"/>
             </toolbar>
     </ui>
     '''
-    def __init__(self, window, trace, options, xscale):
-        gtk.VBox.__init__(self)
 
+    def __init__(self, window, trace, options, xscale):
+        Gtk.VBox.__init__(self)
+
+        # image drawing widget
         self.widget = PyBootchartWidget(trace, options, xscale)
 
+        self.widget.set_tooltip_markup('<b>Keypad</b> to move\n'
+                                       +'<b>+</b> to zoom in\n'
+                                       +'<b>-</b> to zoom out\n'
+                                       +'<b>Ctrl+Wheel</b> to zoom\n'
+                                       +'Horizontal drag with <b>Right button</b> to zoom\n'
+                                       +'<b>Middle click</b> to set mark\n'
+                                       +'Drag with <b>Left button</b> to move')
+        self.widget.set_has_tooltip(False)
+
         # Create a UIManager instance
-        uimanager = self.uimanager = gtk.UIManager()
+        uimanager = self.uimanager = Gtk.UIManager()
 
         # Add the accelerator group to the toplevel window
         accelgroup = uimanager.get_accel_group()
         window.add_accel_group(accelgroup)
 
         # Create an ActionGroup
-        actiongroup = gtk.ActionGroup('Actions')
+        actiongroup = Gtk.ActionGroup('Actions')
         self.actiongroup = actiongroup
 
         # Create actions
         actiongroup.add_actions((
-                ('Expand', gtk.STOCK_ADD, None, None, None, self.widget.on_expand),
-                ('Contract', gtk.STOCK_REMOVE, None, None, None, self.widget.on_contract),
-                ('ZoomIn', gtk.STOCK_ZOOM_IN, None, None, None, self.widget.on_zoom_in),
-                ('ZoomOut', gtk.STOCK_ZOOM_OUT, None, None, None, self.widget.on_zoom_out),
-                ('ZoomFit', gtk.STOCK_ZOOM_FIT, 'Fit Width', None, None, self.widget.on_zoom_fit),
-                ('Zoom100', gtk.STOCK_ZOOM_100, None, None, None, self.widget.on_zoom_100),
+                ('Expand', Gtk.STOCK_ADD, None, None, 'Expand time axis', self.widget.on_expand),
+                ('Contract', Gtk.STOCK_REMOVE, None, None, 'Contract time axis', self.widget.on_contract),
+                ('ZoomIn', Gtk.STOCK_ZOOM_IN, None, None, 'Zoom in', self.widget.on_zoom_in),
+                ('ZoomOut', Gtk.STOCK_ZOOM_OUT, None, None, 'Zoom out', self.widget.on_zoom_out),
+                ('ZoomFit', Gtk.STOCK_ZOOM_FIT, None, None, 'Fit width', self.widget.on_zoom_fit),
+                ('Zoom100', Gtk.STOCK_ZOOM_100, None, None, 'Zoom 100%', self.widget.on_zoom_100),
+        ))
+        actiongroup.add_toggle_actions((
+                ('Help', Gtk.STOCK_HELP, None, None, 'Toggle tooltip with hotkeys', self.show_help, False),
         ))
 
         # Add the actiongroup to the uimanager
@@ -288,46 +284,50 @@ class PyBootchartShell(gtk.VBox):
         uimanager.add_ui_from_string(self.ui)
 
         # Scrolled window
-        scrolled = gtk.ScrolledWindow()
-        scrolled.add(self.widget)
+        scrolled = Gtk.ScrolledWindow()
+        # append image to scrolled
+        scrolled.add(self.widget) # or add_with_viewport?
+        scrolled.set_hadjustment(self.widget.hadj) # possible leak?
+        scrolled.set_vadjustment(self.widget.vadj) # possible leak?
 
         # toolbar / h-box
-        hbox = gtk.HBox(False, 8)
+        hbox = Gtk.HBox(False, 8)
 
         # Create a Toolbar
         toolbar = uimanager.get_widget('/ToolBar')
-        hbox.pack_start(toolbar, True, True)
+        hbox.pack_start(toolbar, True, True, 8)
 
         if not options.kernel_only:
             # Misc. options
-            button = gtk.CheckButton("Show more")
+            button = Gtk.CheckButton("Show more")
             button.connect ('toggled', self.widget.show_toggled)
-            hbox.pack_start (button, False, True)
+            hbox.pack_start (button, False, True, 8)
 
-        self.pack_start(hbox, False)
-        self.pack_start(scrolled)
+        self.pack_start(hbox, False, False, 8)
+        self.pack_start(scrolled, True, True, 8)
+        # select the scrolled component first, then panel's buttons
+        self.set_focus_chain((scrolled, hbox))
         self.show_all()
 
-    def grab_focus(self, window):
-        window.set_focus(self.widget)
+    def show_help(self, act):
+        self.widget.set_has_tooltip(act.get_active())
 
-
-class PyBootchartWindow(gtk.Window):
+class PyBootchartWindow(Gtk.Window):
 
     def __init__(self, trace, app_options):
-        gtk.Window.__init__(self)
+        Gtk.Window.__init__(self)
 
         window = self
         window.set_title("Bootchart %s" % trace.filename)
         window.set_default_size(750, 550)
 
-        tab_page = gtk.Notebook()
+        tab_page = Gtk.Notebook()
         tab_page.show()
         window.add(tab_page)
 
         full_opts = RenderOptions(app_options)
         full_tree = PyBootchartShell(window, trace, full_opts, 1.0)
-        tab_page.append_page (full_tree, gtk.Label("Full tree"))
+        tab_page.append_page (full_tree, Gtk.Label("Full tree"))
 
         if trace.kernel is not None and len (trace.kernel) > 2:
             kernel_opts = RenderOptions(app_options)
@@ -335,13 +335,13 @@ class PyBootchartWindow(gtk.Window):
             kernel_opts.charts = False
             kernel_opts.kernel_only = True
             kernel_tree = PyBootchartShell(window, trace, kernel_opts, 5.0)
-            tab_page.append_page (kernel_tree, gtk.Label("Kernel boot"))
+            tab_page.append_page (kernel_tree, Gtk.Label("Kernel boot"))
 
-        full_tree.grab_focus(self)
+        full_tree.widget.grab_focus() # select the DrawingArea initially
         self.show()
 
 
 def show(trace, options):
     win = PyBootchartWindow(trace, options)
-    win.connect('destroy', gtk.main_quit)
-    gtk.main()
+    win.connect('destroy', Gtk.main_quit)
+    Gtk.main()
